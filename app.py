@@ -9,12 +9,15 @@ import numpy as np
 import pandas as pd
 from ultralytics import YOLO
 from scipy import stats
+from scipy.stats import gaussian_kde
 import matplotlib.pyplot as plt
 import seaborn as sns
 import shutil # Không dùng trong main flow của app
 import random # Không dùng trong main flow của app
 import tempfile # Có thể dùng để lưu file tạm từ upload nếu cần, nhưng Streamlit có thể đọc trực tiếp
-# import tensorflow as tf # Không dùng CNN model ở đây
+import torch
+import torchvision.transforms as transforms
+from model_utils import ResNetWith4Channels  # Giả định file model_utils.py có sẵn
 
 # --- KHAI BÁO BIẾN TOÀN CỤC VÀ CẤU HÌNH (CẦN CHỈNH SỬA) ---
 
@@ -35,11 +38,14 @@ YOLO_MODEL_NAME = 'yolov8n.pt' # Hoặc 'yolov8s.pt', ... (sẽ tải về lần
 VEHICLE_CLASS_IDS_TO_COUNT = [2, 3, 5, 7] # COCO: 2:car, 3:motorcycle, 5:bus, 7:truck
 YOLO_CONFIDENCE_THRESHOLD = 0.3 # Ngưỡng tin cậy cho phát hiện
 
+# Cấu hình CNN
+CNN_MODEL_PATH = 'traffic_density_cnn.pth'
+CLASS_NAMES = ['Low', 'Medium', 'High']
+
 # Cấu hình KDE (Không tính KDE trong ảnh tải lên cho đơn giản)
 # Các biến này chỉ dùng để hiển thị thông tin từ file CSV
 KDE_BANDWIDTH = 30
 DOWNSCALE_FACTOR_FOR_KDE = 4
-
 
 # --- HÀM XỬ LÝ DỮ LIỆU ĐƠN LẺ (ĐẾM XE, GÁN NHÃN) ---
 
@@ -56,6 +62,20 @@ def load_yolo_model(model_name):
         st.error(f"LỖI khi load mô hình YOLO '{model_name}': {e}")
         st.warning("Vui lòng kiểm tra cài đặt thư viện ultralytics và kết nối internet.")
         st.stop() # Dừng ứng dụng nếu load model lỗi
+
+# Load mô hình CNN
+@st.cache_resource
+def load_cnn_model():
+    """Load mô hình CNN và cache nó."""
+    try:
+        model = ResNetWith4Channels(num_classes=3)
+        model.load_state_dict(torch.load(CNN_MODEL_PATH, map_location=torch.device('cpu')))
+        model.eval()
+        return model
+    except Exception as e:
+        st.error(f"LỖI khi load mô hình CNN '{CNN_MODEL_PATH}': {e}")
+        st.warning("Vui lòng kiểm tra đường dẫn file mô hình CNN.")
+        st.stop()
 
 # --- ĐỊNH NGHĨA HÀM BỊ THIẾU ---
 def simple_preprocess_image_streamlit(uploaded_file):
@@ -103,7 +123,6 @@ def assign_density_label(vehicle_count):
     else: # count > COUNT_THRESHOLD_MEDIUM_TO_HIGH
         return 'High'
 
-
 def draw_boxes_on_image(image_np, yolo_results, target_classes):
     """Vẽ bounding box lên ảnh từ kết quả YOLO."""
     if image_np is None or yolo_results is None:
@@ -118,7 +137,6 @@ def draw_boxes_on_image(image_np, yolo_results, target_classes):
     else: # Trường hợp khác
          st.warning(f"Định dạng ảnh đầu vào không chuẩn BGR/Gray: {img_display.shape}. Thử chuyển đổi mặc định.")
          img_display = cv2.cvtColor(img_display, cv2.COLOR_BGR2RGB) # Thử chuyển đổi mặc định
-
 
     count_on_image = 0
     if yolo_results:
@@ -137,6 +155,58 @@ def draw_boxes_on_image(image_np, yolo_results, target_classes):
 
     return img_display # Trả về ảnh đã vẽ box
 
+def predict_density_cnn(image_np_rgb, model, yolo_model):
+    """Dự đoán mật độ giao thông bằng mô hình CNN (dùng KDE thật từ YOLO)."""
+    transform = transforms.Compose([
+        transforms.ToPILImage(),
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])  # Chuẩn hóa ResNet
+    ])
+
+    # Áp dụng transform cho ảnh RGB
+    rgb_tensor = transform(image_np_rgb)
+
+    # === Tính KDE thực tế từ YOLO ===
+    image_h, image_w = image_np_rgb.shape[:2]
+    results = yolo_model(image_np_rgb, verbose=False, conf=0.3)
+    centroids = []
+
+    for result in results:
+        for box in result.boxes:
+            if int(box.cls[0]) in VEHICLE_CLASS_IDS_TO_COUNT:
+                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                cx = (x1 + x2) / 2 / image_w
+                cy = (y1 + y2) / 2 / image_h
+                centroids.append([cx, cy])
+
+    # Nếu centroids không đủ → dùng tensor 0
+    if len(centroids) < 2:
+        kde_tensor = torch.zeros(1, 224, 224)
+    else:
+        try:
+            x, y = zip(*centroids)
+            x = np.array(x) + np.random.normal(0, 1e-4, len(x))
+            y = np.array(y) + np.random.normal(0, 1e-4, len(y))
+            kde = gaussian_kde([x, y], bw_method=0.2)
+            X, Y = np.meshgrid(np.linspace(0, 1, 224), np.linspace(0, 1, 224))
+            positions = np.vstack([X.ravel(), Y.ravel()])
+            kde_values = kde(positions).reshape(224, 224)
+            kde_tensor = torch.tensor(kde_values, dtype=torch.float32).unsqueeze(0)
+        except np.linalg.LinAlgError:
+            kde_tensor = torch.zeros(1, 224, 224)
+
+    # Tạo input 4 channel
+    input_tensor = torch.cat([rgb_tensor, kde_tensor], dim=0).unsqueeze(0)
+
+    # Dự đoán
+    with torch.no_grad():
+        output = model(input_tensor)
+        pred = torch.argmax(output, dim=1).item()
+        prob = torch.softmax(output, dim=1)[0][pred].item()
+
+    return CLASS_NAMES[pred], prob
+
 # --- GIAO DIỆN STREAMLIT ---
 
 def main():
@@ -148,24 +218,23 @@ def main():
     )
 
     st.title("Ứng dụng Phân loại và Đánh giá Mật độ Giao thông")
-    st.write("Sử dụng Học sâu (YOLOv8) để đếm phương tiện và ước lượng mật độ từ hình ảnh.")
+    st.write("Sử dụng Học sâu (YOLOv8 và CNN) để đếm phương tiện và ước lượng mật độ từ hình ảnh.")
 
-    # Load mô hình YOLO một lần và cache lại
+    # Load mô hình YOLO và CNN
     yolo_model = load_yolo_model(YOLO_MODEL_NAME)
+    cnn_model = load_cnn_model()
 
-    # Lấy tên lớp từ model (sau khi model đã load)
+    # Lấy tên lớp từ model YOLO (sau khi model đã load)
     try:
          model_names = yolo_model.names
     except Exception:
          model_names = {cid: f'Class_{cid}' for cid in VEHICLE_CLASS_IDS_TO_COUNT} # Fallback nếu không lấy được tên lớp
-
-
-    # --- Sidebar ---
+    # -- Sidebar ---
     st.sidebar.header("Cấu hình & Thông tin")
     st.sidebar.write(f"Mô hình YOLO: {YOLO_MODEL_NAME}")
     st.sidebar.write(f"Ngưỡng tin cậy YOLO: {YOLO_CONFIDENCE_THRESHOLD}")
     st.sidebar.write(f"Các lớp phương tiện đếm: {', '.join([model_names.get(cid, f'Class_{cid}') for cid in VEHICLE_CLASS_IDS_TO_COUNT])}")
-
+    st.sidebar.write(f"Mô hình CNN: {CNN_MODEL_PATH}")
 
     st.sidebar.header("Ngưỡng Mật độ")
     # Hiển thị mô tả ngưỡng chính xác
@@ -234,7 +303,6 @@ def main():
             else:
                  st.warning("Không tìm thấy cột 'vehicle_count' trong file CSV để tính nhãn.")
 
-
         except FileNotFoundError:
              st.error(f"Không tìm thấy file phân tích '{ANALYSIS_CSV_PATH}'.")
              st.info("Vui lòng chạy script phân tích ban đầu (main.py) để tạo file này.")
@@ -243,7 +311,6 @@ def main():
             st.warning("Hãy đảm bảo file CSV tồn tại và đúng định dạng.")
     else:
         st.info(f"Không tìm thấy file phân tích '{ANALYSIS_CSV_PATH}'. Vui lòng chạy script phân tích ban đầu (main.py) để tạo file này.")
-
 
     # --- Section: Kiểm tra Mật độ trên Ảnh mới ---
     st.header("Kiểm tra Mật độ trên Ảnh mới")
@@ -257,7 +324,8 @@ def main():
 
         if image_np_bgr is not None:
             # Streamlit expect RGB, simple_preprocess_image_streamlit trả về BGR
-            st.image(cv2.cvtColor(image_np_bgr, cv2.COLOR_BGR2RGB), caption="Ảnh gốc được tải lên", use_column_width=True)
+            image_np_rgb = cv2.cvtColor(image_np_bgr, cv2.COLOR_BGR2RGB)
+            st.image(image_np_rgb, caption="Ảnh gốc được tải lên", use_column_width=True)
 
             # Chạy xử lý khi có ảnh
             st.write("Đang xử lý ảnh...")
@@ -269,7 +337,7 @@ def main():
             # Gán nhãn mật độ dựa trên số lượng đếm được và ngưỡng cố định trong app
             density_label = assign_density_label(vehicle_count)
 
-            st.write("---")
+            st.subheader("🔍 Kết quả từ YOLO (Đếm xe)")
             st.write(f"**Số lượng Phương tiện Đếm được:** {vehicle_count}")
             st.write(f"**Mật độ Ước lượng:** {density_label}")
 
@@ -281,9 +349,18 @@ def main():
                      # draw_boxes_on_image trả về RGB, phù hợp cho st.image
                      st.image(image_with_boxes, caption=f"Kết quả đếm xe (Tổng: {vehicle_count})", use_column_width=True)
 
-            st.write("---")
-            st.write("*(Lưu ý: Việc đếm xe và ước lượng mật độ dựa trên mô hình YOLOv8n và các ngưỡng đã xác định trước đó. Độ chính xác có thể thay đổi tùy thuộc vào chất lượng ảnh và điều kiện giao thông.)*")
+            # Chạy CNN phân tích
+            st.subheader("🧠 Kết quả từ CNN (Phân loại ảnh)")
+            label, conf = predict_density_cnn(image_np_rgb, cnn_model, yolo_model)
+            st.write(f"**Mật độ dự đoán bởi CNN:** {label}")
+            st.write(f"**Độ tin cậy:** {conf:.2f}")
 
+            # So sánh kết quả YOLO và CNN
+            if label != density_label:
+                st.warning(f"⚠️ Mô hình YOLO và CNN cho kết quả khác nhau: YOLO → {density_label}, CNN → {label}")
+
+            st.write("---")
+            st.write("*(Lưu ý: Việc đếm xe và ước lượng mật độ dựa trên mô hình YOLOv8n và CNN với các ngưỡng đã xác định trước đó. Độ chính xác có thể thay đổi tùy thuộc vào chất lượng ảnh và điều kiện giao thông.)*")
 
     else:
         st.info("Vui lòng tải lên một file ảnh để bắt đầu kiểm tra.")

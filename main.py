@@ -6,6 +6,7 @@
 # (Windows) .venv\Scripts\activate    # Kích hoạt môi trường ảo (Windows)
 # (macOS/Linux) source .venv/bin/activate # Kích hoạt môi trường ảo (macOS/Linux)
 # pip install opencv-python numpy pandas matplotlib scikit-learn ultralytics pillow tqdm seaborn tkinter # Cài đặt tất cả thư viện cần thiết
+# train_density_cnn.py để huấn luyện
 
 # --- IMPORT THƯ VIỆN ---
 print("--- Đang Import Thư viện ---")
