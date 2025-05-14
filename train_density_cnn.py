@@ -14,7 +14,7 @@ import glob
 import shutil
 import logging
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
-
+import pandas as pd
 # ----- CẤU HÌNH -----
 DATA_DIR = './traffic_analysis_output/processed_for_cnn'
 NUM_CLASSES = 3  # Low, Medium, High
@@ -211,6 +211,15 @@ def train_model():
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.1)
 
+    history = {
+        'train_loss': [],
+        'train_acc': [],
+        'val_acc': [],
+        'mse': [],
+        'mae': [],
+        'r2': [],
+    }
+
     for epoch in range(NUM_EPOCHS):
         model.train()
         total_loss = 0
@@ -259,12 +268,22 @@ def train_model():
 
             print(f"Validation Accuracy: {val_acc*100:.2f}% | MSE: {mse:.4f} | MAE: {mae:.4f} | R²: {r2:.4f}")
 
+            history['train_loss'].append(total_loss)
+            history['train_acc'].append(acc)
+            history['val_acc'].append(val_acc)
+            history['mse'].append(mse)
+            history['mae'].append(mae)
+            history['r2'].append(r2)
 
         scheduler.step()
 
     # Lưu model
     torch.save(model.state_dict(), "traffic_density_cnn.pth")
     print("✅ Đã lưu model vào 'traffic_density_cnn.pth'")
+
+    df_history = pd.DataFrame(history)
+    df_history.to_csv("training_history.csv", index=False)
+    print("Đã lưu lịch sử training vào 'training_history.csv'")
 
 if __name__ == "__main__":
     # Kiểm tra tập dữ liệu
