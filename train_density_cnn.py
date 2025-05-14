@@ -13,6 +13,7 @@ import cv2
 import glob
 import shutil
 import logging
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 
 # ----- CẤU HÌNH -----
 DATA_DIR = './traffic_analysis_output/processed_for_cnn'
@@ -233,18 +234,31 @@ def train_model():
         print(f"Train Loss: {total_loss:.4f} | Train Acc: {acc*100:.2f}%")
 
         # Đánh giá trên tập validation
+        # Đánh giá trên tập validation
         model.eval()
         with torch.no_grad():
             correct = 0
             total = 0
+            all_preds = []
+            all_labels = []
+
             for images, labels in valid_loader:
                 images, labels = images.to(DEVICE), labels.to(DEVICE)
                 outputs = model(images)
                 _, preds = outputs.max(1)
                 correct += (preds == labels).sum().item()
                 total += labels.size(0)
+
+                all_preds.extend(preds.cpu().numpy())
+                all_labels.extend(labels.cpu().numpy())
+
             val_acc = correct / total
-            print(f"Validation Accuracy: {val_acc*100:.2f}%")
+            mse = mean_squared_error(all_labels, all_preds)
+            mae = mean_absolute_error(all_labels, all_preds)
+            r2 = r2_score(all_labels, all_preds)
+
+            print(f"Validation Accuracy: {val_acc*100:.2f}% | MSE: {mse:.4f} | MAE: {mae:.4f} | R²: {r2:.4f}")
+
 
         scheduler.step()
 
