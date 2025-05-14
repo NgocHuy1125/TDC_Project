@@ -219,6 +219,10 @@ def train_model():
         'mae': [],
         'r2': [],
     }
+    
+    best_val_acc = 0
+    early_stop_counter = 0
+    PATIENCE = 5  # Số epoch không cải thiện trước khi dừng
 
     for epoch in range(NUM_EPOCHS):
         model.train()
@@ -274,6 +278,18 @@ def train_model():
             history['mse'].append(mse)
             history['mae'].append(mae)
             history['r2'].append(r2)
+            
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                early_stop_counter = 0
+                torch.save(model.state_dict(), "best_traffic_density_cnn.pth")  # Lưu model tốt nhất
+                print("Đã lưu model tốt nhất.")
+            else:
+                early_stop_counter += 1
+                print(f"Không cải thiện ({early_stop_counter}/{PATIENCE})")
+                if early_stop_counter >= PATIENCE:
+                    print(f"Early stopping sau {epoch+1} epochs.")
+                    break
 
         scheduler.step()
 
